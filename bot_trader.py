@@ -1423,7 +1423,7 @@ class BotTrader:
                     avs_max = getattr(self._quant, 'AVS_GRID_PCT_MAX', 0.15)
                     grid_pct_dynamic = min(max(grid_pct_dynamic, avs_min), avs_max)
                 else:
-                    grid_pct_dynamic = min(max(grid_pct_dynamic, 0.01), 0.20)
+                    grid_pct_dynamic = min(max(grid_pct_dynamic, GRID_PCT), 0.20)
                 print(f"  📡 NF: spread {old_pct*100:.2f}%→{grid_pct_dynamic*100:.2f}% (sentiment ×{nf_mult:.2f})")
 
         if AVS_ENABLED and quant['enabled']:
@@ -3122,7 +3122,15 @@ if __name__ == '__main__':
     parser.add_argument('--real', action='store_true', help='Mode réel (place les ordres sur Binance)')
     parser.add_argument('--dryrun', action='store_true', help='Dry-run : simule les appels API sans exécuter')
     parser.add_argument('--kelly', action='store_true', help='Allocation Kelly au lieu du capital fixe')
+    parser.add_argument('--grid-pct', type=float, default=None, help='Forcer le gap de grille, ex: 0.006 = ±0.3%%')
     args = parser.parse_args()
+
+    # Surcharge du GRID_PCT global si --grid-pct fourni
+    if args.grid_pct is not None:
+        import sys as _sys
+        _mod = _sys.modules[__name__]
+        _mod.GRID_PCT = args.grid_pct
+        print(f"⚙️  GRID_PCT surchargé → {args.grid_pct*100:.2f}% (±{args.grid_pct/2*100:.2f}% par côté)")
 
     name = args.name or args.symbol.replace('USDT', '')
     bot = BotTrader(args.symbol, args.capital, name, args.real, args.dryrun, args.kelly)
