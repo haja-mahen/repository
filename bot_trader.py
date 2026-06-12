@@ -75,6 +75,13 @@ P1_FILTER_ENABLED = True           # Activer le filtre P1
 P1_SYMBOLS = ['ALL']               # 'ALL' = toutes les paires, ou liste: ['XLM', 'ADA', ...]
 P1_MIN_DROP_PCT = 1.0              # Bloquer seulement si la baisse 24h dépasse ce seuil (%)
 
+# 📈 Trend Gate — Blocage BUY pendant forte tendance baissière + déverrouillage sur confirmation
+TREND_GATE_ENABLED = True          # Activer le filtre de tendance
+TREND_GATE_BEARISH_CANDLES = 3     # N bougies 1h rouges consécutives → verrouillage
+TREND_GATE_RSI_UNLOCK = 50         # RSI minimum pour confirmer le retournement
+TREND_GATE_INTERVAL = '1h'         # Timeframe d'analyse
+TREND_GATE_REFRESH_SEC = 300       # Rafraîchissement du signal (5 min)
+
 # 🔄 Rebalancing — Auto-stop pour paires défaillantes
 REBALANCE_ENABLED = True           # Activer le rebalancement automatique
 REBALANCE_MIN_CYCLES = 10          # Cycles minimum avant analyse
@@ -249,6 +256,78 @@ def get_trend_24h(symbol):
         print(f"  ⚠️ P1 error: {e}")
         return False, 0.0, 0.0
 
+def get_trend_signal(symbol, interval='1h'):
+    """Analyse la tendance courante en un seul appel API (EMA 30 + RSI 14 + bougies).
+
+    Retourne un dict ou None si erreur:
+      consecutive_red  : int   — bougies 1h rouges consécutives (bougies fermées)
+      above_ema        : bool  — prix actuel > EMA 30h
+      last_candle_bull : bool  — dernière bougie fermée haussière
+      rsi              : float — RSI 14
+      price            : float — prix actuel
+      ema              : float — EMA 30h
+    """
+    try:
+        r = requests.get(
+            f"{BASE}/api/v3/klines",
+            params={'symbol': symbol, 'interval': interval, 'limit': 60},
+            timeout=5
+        )
+        data = r.json()
+        if len(data) < 35:
+            return None
+
+        closes = [float(k[4]) for k in data]
+        opens  = [float(k[1]) for k in data]
+
+        # ── EMA 30 ───────────────────────────────────────────
+        ema_period = 30
+        sma = sum(closes[:ema_period]) / ema_period
+        mult = 2.0 / (ema_period + 1)
+        ema = sma
+        for p in closes[ema_period:]:
+            ema = (p - ema) * mult + ema
+
+        # ── RSI 14 (Wilder) ──────────────────────────────────
+        rsi_period = 14
+        deltas = [closes[i] - closes[i-1] for i in range(1, len(closes))]
+        gains  = [max(d, 0)    for d in deltas]
+        losses = [abs(min(d, 0)) for d in deltas]
+        avg_gain = sum(gains[:rsi_period]) / rsi_period
+        avg_loss = sum(losses[:rsi_period]) / rsi_period
+        for i in range(rsi_period, len(gains)):
+            avg_gain = (avg_gain * (rsi_period - 1) + gains[i]) / rsi_period
+            avg_loss = (avg_loss * (rsi_period - 1) + losses[i]) / rsi_period
+        rsi = 100.0 if avg_loss == 0 else round(100 - (100 / (1 + avg_gain / avg_loss)), 1)
+
+        # ── Bougies consécutives rouges (hors bougie courante) ──
+        # La bougie courante n'est pas encore fermée → l'exclure
+        closed_opens  = opens[:-1]
+        closed_closes = closes[:-1]
+        consecutive_red = 0
+        for i in range(len(closed_closes) - 1, max(len(closed_closes) - 9, -1), -1):
+            if closed_closes[i] < closed_opens[i]:
+                consecutive_red += 1
+            else:
+                break
+
+        current_price    = closes[-1]
+        last_candle_bull = closed_closes[-1] > closed_opens[-1]
+        above_ema        = current_price > ema
+
+        return {
+            'consecutive_red':  consecutive_red,
+            'above_ema':        above_ema,
+            'last_candle_bull': last_candle_bull,
+            'rsi':              rsi,
+            'price':            current_price,
+            'ema':              round(ema, 6),
+        }
+    except Exception as e:
+        print(f"  ⚠️ TrendGate signal error: {e}")
+        return None
+
+
 def _binance_call(method, url, headers, timeout=10, max_retries=3):
     """Exécute un appel HTTP Binance avec retry exponentiel sur 429/5xx.
     Ne reessaie PAS les 4xx (erreurs client — ordre invalide, solde insuffisant, etc.)
@@ -374,6 +453,10 @@ class BotTrader:
                             newsapi_key=NF_NEWSAPI_KEY) if NF_ENABLED else None
         self._last_nf_refresh = 0
         self._nf_result = None
+
+        # 🚦 TrendGate — cache signal de tendance (évite appels API répétés)
+        self._trend_gate_cache = None
+        self._trend_gate_last_check = 0
 
         # Lot size & tick size
         self.lot_step = 0.1
@@ -2090,6 +2173,57 @@ class BotTrader:
         print(f"  🛟 [Paper] Capital libéré! Achat ${buy_price:.4f} → Vente @ ${price*(1+CAPITAL_LIB_NEW_SPREAD):.4f}")
         return s, True
 
+    def _check_trend_gate(self, s):
+        """🚦 TrendGate — verrouille les BUY lors d'une forte tendance baissière.
+
+        Verrouillage  : N bougies rouges consécutives ET prix < EMA 30h
+        Déverrouillage: prix > EMA 30h ET RSI >= seuil ET dernière bougie haussière
+
+        Retourne True si les BUY sont bloqués (locked), False sinon.
+        """
+        if not TREND_GATE_ENABLED:
+            return False
+
+        now = time.time()
+        if now - self._trend_gate_last_check >= TREND_GATE_REFRESH_SEC:
+            self._trend_gate_cache = get_trend_signal(self.symbol, TREND_GATE_INTERVAL)
+            self._trend_gate_last_check = now
+
+        sig = self._trend_gate_cache
+        if sig is None:
+            return False  # Si erreur API → laisser passer (fail-open)
+
+        currently_locked = s.get('_trend_locked', False)
+
+        if not currently_locked:
+            # Condition de verrouillage : N bougies rouges ET sous EMA
+            if sig['consecutive_red'] >= TREND_GATE_BEARISH_CANDLES and not sig['above_ema']:
+                s['_trend_locked'] = True
+                self.save_state(s)
+                msg = (f"🚦 TrendGate LOCK — {self.name}\n"
+                       f"{sig['consecutive_red']} bougies rouges | RSI {sig['rsi']:.1f} | "
+                       f"Prix ${sig['price']:.4f} < EMA ${sig['ema']:.4f}\n"
+                       f"BUY suspendus jusqu'au retournement confirmé")
+                self.tg_send(msg)
+                print(f"  🚦 TrendGate LOCK {self.name} — {sig['consecutive_red']} bougies rouges, RSI {sig['rsi']:.1f}, sous EMA")
+                return True
+            return False
+        else:
+            # Condition de déverrouillage : prix > EMA ET RSI >= seuil ET bougie haussière
+            if sig['above_ema'] and sig['rsi'] >= TREND_GATE_RSI_UNLOCK and sig['last_candle_bull']:
+                s['_trend_locked'] = False
+                self.save_state(s)
+                msg = (f"✅ TrendGate UNLOCK — {self.name}\n"
+                       f"RSI {sig['rsi']:.1f} ≥ {TREND_GATE_RSI_UNLOCK} | "
+                       f"Prix ${sig['price']:.4f} > EMA ${sig['ema']:.4f} | "
+                       f"Bougie haussière confirmée\n"
+                       f"BUY ré-autorisés")
+                self.tg_send(msg)
+                print(f"  ✅ TrendGate UNLOCK {self.name} — RSI {sig['rsi']:.1f}, au-dessus EMA, bougie haussière")
+                return False
+            # Toujours verrouillé
+            return True
+
     def should_redeploy(self, s, price):
         if s.get('frozen', False):
             return False, "frozen"
@@ -2116,6 +2250,11 @@ class BotTrader:
                 if drop_pct >= P1_MIN_DROP_PCT:
                     print(f"  🧠 P1: {self.name} — tendance 24h négative (${price_24h:.4f} → ${price_now:.4f}, -{drop_pct:.1f}%), BUY bloqué")
                     return False, f"P1: 24h downtrend (-{drop_pct:.1f}%)"
+        # 🚦 TrendGate — Bloquer le redéploiement si forte tendance baissière en cours
+        if self._check_trend_gate(s):
+            sig = self._trend_gate_cache
+            rsi_str = f", RSI {sig['rsi']:.1f}" if sig else ""
+            return False, f"trend_gate: strong downtrend locked{rsi_str}"
         entry = s.get('entry_price', price)
         levels = s.get('levels', [])
         lo = s.get('level_orders', {})
