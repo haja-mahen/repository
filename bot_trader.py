@@ -709,7 +709,10 @@ class BotTrader:
             return None
 
     def _real_cancel_all(self):
-        """Annule tous les ordres ouverts sur cette paire"""
+        """Annule tous les ordres ouverts sur cette paire (BUY + SELL).
+        ⚠️ Usage restreint — réservé aux arrêts explicitement autorisés par l'utilisateur
+        (stop file, Ctrl+C). Pour les gels et protections automatiques, utiliser
+        _real_cancel_buys_only() qui préserve les SELL."""
         if self.dry_run:
             print(f"  [DRY-RUN] Cancel all orders {self.symbol}")
             return True
@@ -720,6 +723,33 @@ class BotTrader:
                 print(f"  ✅ {len(cancelled)} ordres annulés")
             return True
         return False
+
+    def _real_cancel_buys_only(self):
+        """Annule UNIQUEMENT les ordres BUY ouverts — ne touche jamais aux SELL.
+        Règle SPOT: les SELL ne peuvent être annulés sans autorisation explicite
+        de l'utilisateur (frais déjà engagés économiquement sur position longue)."""
+        if self.dry_run:
+            print(f"  [DRY-RUN] Cancel BUY orders only {self.symbol} (SELL préservés)")
+            return True, 0
+        open_orders = self._real_get_open_orders()
+        if open_orders is None:
+            return False, 0
+        cancelled = 0
+        preserved = 0
+        for o in open_orders:
+            if o['side'].upper() == 'BUY':
+                r = binance_signed_delete('/api/v3/order', {
+                    'symbol': self.symbol, 'orderId': o['orderId']
+                })
+                if r and r.status_code == 200:
+                    cancelled += 1
+                else:
+                    print(f"  ⚠️ Échec cancel BUY {o['orderId']}")
+            else:
+                preserved += 1
+        if cancelled or preserved:
+            print(f"  ✅ {cancelled} BUY annulés | {preserved} SELL préservés")
+        return True, preserved
 
     def _real_get_open_orders(self):
         """Récupère tous les ordres ouverts sur cette paire (None = erreur API)"""
@@ -1618,13 +1648,22 @@ class BotTrader:
             needed_keys = set(f"{float(p)}:{t}" for p, t in level_orders.items())
             existing_keys = set(existing_by_key.keys())
 
-            keys_to_cancel = existing_keys - needed_keys
+            keys_to_cancel_raw = existing_keys - needed_keys
             keys_to_place = needed_keys - existing_keys
+
+            # Règle SPOT: ne jamais annuler un SELL sans autorisation explicite.
+            # Si un redéploiement veut supprimer un SELL existant, on le préserve.
+            sell_keys_preserved = {k for k in keys_to_cancel_raw if k.endswith(':sell')}
+            keys_to_cancel = keys_to_cancel_raw - sell_keys_preserved
+            if sell_keys_preserved:
+                print(f"  🛡️ {len(sell_keys_preserved)} SELL préservé(s) — non annulé(s) sans autorisation")
+                # Retirer aussi le placement du SELL déjà présent sur Binance
+                keys_to_place -= sell_keys_preserved
 
             if keys_to_cancel or keys_to_place:
                 print(f"  🌐 Déploiement RÉEL — {len(keys_to_cancel)} annulations, {len(keys_to_place)} placements")
 
-            # Annuler UNIQUEMENT les ordres qui ne sont plus nécessaires
+            # Annuler UNIQUEMENT les ordres BUY qui ne sont plus nécessaires
             cancelled_ids = set()
             for key in keys_to_cancel:
                 oid = existing_by_key[key]
@@ -1905,11 +1944,22 @@ class BotTrader:
             if trail.get('active') and pullback_from_peak >= TRAILING_CALLBACK_PCT:
                 qty = s.get('qty', 0.1)
                 if self.real_mode:
-                    self._real_cancel_all()
-                    # ⚠️ CRITIQUE: vider TOUS les levels de lo après cancel_all
-                    # Sinon recycle() traite les ordres annulés comme "filled"
-                    # et génère des USDT/tokens fictifs.
-                    lo.clear()
+                    # Règle SPOT: ne jamais annuler un SELL existant.
+                    # Si un SELL est déjà positionné sur ce niveau (grid), il sera
+                    # exécuté naturellement au prix prévu. On n'intervient que si
+                    # aucun SELL n'existe (position orpheline).
+                    existing_sell = any(v == 'sell' for v in lo.values())
+                    if existing_sell:
+                        # SELL déjà en place → pas d'action, laisser la grille fonctionner
+                        if trail_key in s:
+                            del s[trail_key]
+                        print(f"  🎯 Trailing: SELL existant préservé @ niveau(x) actif(s) — pas d'intervention")
+                        continue
+                    # Pas de SELL → annuler uniquement les BUY et placer un SELL trailing
+                    self._real_cancel_buys_only()
+                    buy_keys = [k for k, v in lo.items() if v == 'buy']
+                    for k in buy_keys:
+                        del lo[k]
                     # Placer un ordre LIMIT au prix actuel pour vendre
                     result = self._real_place_order('sell', qty, price)
                     if not result:
@@ -1984,26 +2034,45 @@ class BotTrader:
         lo = s.get('level_orders', {})
         qty = s.get('qty', 0.1)
 
-        # Annuler tous les ordres ouverts
         if self.real_mode:
-            self._real_cancel_all()
-            lo.clear()
+            # Règle SPOT: vérifier si un SELL est déjà ouvert sur Binance.
+            # Si oui, ne pas l'annuler — seulement annuler les BUY.
+            existing_sells = {k: v for k, v in lo.items() if v == 'sell'}
+            if existing_sells:
+                # SELL déjà en place → annuler uniquement les BUY, alerter
+                self._real_cancel_buys_only()
+                for k in [k for k, v in lo.items() if v == 'buy']:
+                    del lo[k]
+                s['level_orders'] = lo
+                s.pop('_stuck_since', None)
+                self.save_state(s)
+                sell_prices_str = ', '.join(f"${float(k):.4f}" for k in existing_sells)
+                msg = (f"🛟 Capital lib. — {self.name}\n"
+                       f"SELL existant conservé @ {sell_prices_str}\n"
+                       f"BUY annulés | ⏱️ Bloqué {int(elapsed/60)} min")
+                self.tg_send(msg)
+                print(f"  🛟 {self.name} — BUY annulés, SELL existant préservé @ {sell_prices_str}")
+                return s, True
 
-            # Placer un nouveau SELL à prix + spread
+            # Aucun SELL → annuler BUY et placer un nouveau SELL à prix + spread
+            self._real_cancel_buys_only()
+            for k in [k for k, v in lo.items() if v == 'buy']:
+                del lo[k]
+
             sell_price = fmt_price(price * (1 + CAPITAL_LIB_NEW_SPREAD), self.tick_size)
             result = self._real_place_order('sell', qty, sell_price)
             if result:
                 lo[str(sell_price)] = 'sell'
+                s['level_orders'] = lo
                 s['tokens_locked'] = qty
                 s['tokens_free'] = max(0, s.get('tokens_free', 0))
-                # Reset des métriques de blocage
                 s.pop('last_buy_time', None)
                 s.pop('last_buy_price', None)
                 s.pop('_stuck_since', None)
                 self.save_state(s)
                 loss_pct = (sell_price - buy_price) / buy_price * 100
-                msg = (f"🛟 Capital libéré — {self.name}\\n"
-                       f"Achat @ ${buy_price:.4f} → Vente @ ${sell_price:.4f} ({loss_pct:+.2f}%)\\n"
+                msg = (f"🛟 Capital libéré — {self.name}\n"
+                       f"Achat @ ${buy_price:.4f} → Vente @ ${sell_price:.4f} ({loss_pct:+.2f}%)\n"
                        f"⏱️ Bloqué {int(elapsed/60)} min | 📉 Baisse max {drop*100:.2f}%")
                 self.tg_send(msg)
                 print(f"  🛟 {self.name} — Capital libéré! SELL @ ${sell_price:.4f}")
@@ -2596,7 +2665,10 @@ class BotTrader:
                     if s.get('total_cycles', 0) > 0 and loss > s.get('day_start_value', pv) * MAX_DAILY_LOSS_PCT:
                         self.tg_send(f"🚨 DAILY LOSS 3% | PV=${pv:.2f} ({log_fields['loss_pct']}%) | cycle #{s.get('total_cycles',0)}")
                         if self.real_mode:
-                            self._real_cancel_all()
+                            # Préserver les SELL: la position peut encore récupérer
+                            _, sells_kept = self._real_cancel_buys_only()
+                            if sells_kept:
+                                self.tg_send(f"🛡️ {sells_kept} SELL préservé(s) — resteront actifs")
                         break
 
                     # Phase 2 stop — ignorer si pas encore de cycle ou si position active
@@ -2610,7 +2682,7 @@ class BotTrader:
                             if p2loss > PHASE2_STOP_PCT:
                                 self.tg_send(f"🛑 PHASE 2 STOP -2%\nPortefeuille: ${pv:.2f}")
                                 if self.real_mode:
-                                    self._real_cancel_all()
+                                    self._real_cancel_buys_only()
                                 break
 
                     # 🛡️ Price Circuit Breaker
@@ -2632,7 +2704,8 @@ class BotTrader:
                         s['usdt_free'] = round(s.get('usdt_free', 0) + s.get('usdt_locked', 0), 2)
                         s['usdt_locked'] = 0
                         if self.real_mode:
-                            self._real_cancel_all()
+                            # CB L2: annuler uniquement les BUY — les SELL restent actifs
+                            self._real_cancel_buys_only()
                         self.save_state(s)
                         self.tg_send(f"⚠️ PRICE CB L2 🟡 — -{drop_from_entry*100:.1f}% depuis entry\n"
                                      f"📋 {buy_removed} BUY supprimés → Sell-only")
@@ -2649,7 +2722,8 @@ class BotTrader:
                         s['freeze_drop_pct'] = drop_from_entry
                         self.save_state(s)
                         if self.real_mode:
-                            self._real_cancel_all()
+                            # CB L1: geler les BUY uniquement — les SELL restent actifs
+                            self._real_cancel_buys_only()
                         self.tg_send(f"⚠️ PRICE CB L1 🟢 — -{drop_from_entry*100:.1f}% depuis entry ${entry:.4f}\n"
                                      f"🧊 BUY gelés. Surveillance en cours...")
                         print(f"🟢 {self.name} — PRICE CB L1 à ${price:.4f} ({drop_from_entry*100:.1f}% drop)")
@@ -2737,7 +2811,8 @@ class BotTrader:
                                 s['usdt_locked'] = 0
 
                             if self.real_mode:
-                                self._real_cancel_all()
+                                # MAF GEL: annuler uniquement les BUY — les SELL restent actifs
+                                self._real_cancel_buys_only()
                             self.save_state(s)
 
                             freeze_icon = "⚡" if freeze_drop_now else "🧊"
@@ -2895,7 +2970,8 @@ class BotTrader:
                 if s.get('_consecutive_errors', 0) > 10:
                     self.tg_send(f"🔥 Trop d'erreurs consécutives — arrêt")
                     if self.real_mode:
-                        self._real_cancel_all()
+                        # Préserver les SELL même en cas d'arrêt sur erreur
+                        self._real_cancel_buys_only()
                     break
                 time.sleep(10)
 
